@@ -95,6 +95,12 @@ func (c *LRUCache[K, V]) Delete(key K) {
 	}
 }
 
+// Contains checks if key exists in the cache.
+func (c *LRUCache[K, V]) Contains(key K) bool {
+	_, exists := c.cache[key]
+	return exists
+}
+
 // Returns the current number fo items in cache.
 func (c *LRUCache[K, V]) Len() int {
 	return c.lruList.Len()
