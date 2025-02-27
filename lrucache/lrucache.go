@@ -76,14 +76,12 @@ func (c *LRUCache[K, V]) Set(key K, value V) {
 		toEvict := c.lruList.Back()
 		if toEvict != nil {
 			delete(c.cache, toEvict.Value.(*CacheItem[K, V]).key)
+			c.lruList.Remove(toEvict)
 		}
 	}
 
 	// push the newly added item in front
-	c.cache[key] = c.lruList.PushFront(&CacheItem[K, V]{
-		key:   key,
-		value: value,
-	})
+	c.cache[key] = c.lruList.PushFront(&CacheItem[K, V]{key, value})
 }
 
 // Delete removes the item from cache.
