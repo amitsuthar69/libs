@@ -1,3 +1,7 @@
+// tcpnode is so far my theoretical assumption of a main routine having both server and client as sub-routines
+// hence, making it act as an independent peer in a p2p environment.
+//
+// It still need a lot of improvements. It works but with workarounds
 package tcpnode
 
 import (
