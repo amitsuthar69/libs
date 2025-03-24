@@ -9,4 +9,4 @@ Imagine Node 1 (server1, client1) and a Node 2 (server2, client2)
 - This results into two node connected over TCP, able to process and share data.
 - Each node maintains a map of active peers.
 - illustration:
-  ![overview](https://gist.github.com/user-attachments/assets/831fd408-5e98-4118-b784-75ba4b4d291c)
+  ![overview](https://github.com/user-attachments/assets/6edd2f98-0f50-4859-b7c9-e8f36e9cc020)
