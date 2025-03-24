@@ -1,227 +1,177 @@
-// tcpnode is so far my theoretical assumption of a main routine having both server and client as sub-routines
-// hence, making it act as an independent peer in a p2p environment.
-//
-// It still need a lot of improvements. It works but with workarounds
+// tcpnode is so far my theoretical assumption of a main routine having both server and client as sub-routines,
+// making it act as an independent peer in a p2p environment.
 package tcpnode
 
 import (
 	"log"
 	"net"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 )
 
-type client struct {
-	conn net.Conn
-	addr string
-}
-
-type TCPNode struct {
+type Peer struct {
+	peerId     string // peerId is nodeId
 	serverAddr string
-	clients    []client
-	mu         sync.Mutex
-	MsgChan    chan string
-	stopChan   chan struct{}
+	conn       net.Conn
 }
 
-func NewTCPNode(serverAddr string) *TCPNode {
+// A TCPNode should act as an independent peer in a p2p network
+type TCPNode struct {
+	nodeId     string
+	serverAddr string
+	peers      map[string]*Peer
+	mu         sync.Mutex
+	msgChan    chan Message
+	stopChan   chan struct{}
+	stopOnce   sync.Once
+}
+
+func NewTCPNode(nodeId, serverAddr string) *TCPNode {
 	return &TCPNode{
+		nodeId:     nodeId,
 		serverAddr: serverAddr,
-		clients:    make([]client, 0),
-		MsgChan:    make(chan string),
+		peers:      make(map[string]*Peer, 0),
+		msgChan:    make(chan Message),
 		stopChan:   make(chan struct{}),
 	}
 }
 
-func (n *TCPNode) shakeHands(conn net.Conn) {
-	buf := make([]byte, 1024)
-
-	// read thy server addr
-	x, err := conn.Read(buf)
-	if err != nil {
-		log.Printf("Error reading handshake: %v", err)
-		return
-	}
-
-	// tell our server addr
-	_, err = conn.Write([]byte(n.serverAddr))
-	if err != nil {
-		log.Printf("Error writing handshake: %v", err)
-		return
-	}
-
-	remoteAddr := strings.TrimSpace(string(buf[:x]))
-	n.mu.Lock()
-	n.clients = append(n.clients, client{conn: conn, addr: remoteAddr})
-	n.mu.Unlock()
-
-	n.MsgChan <- remoteAddr
-	log.Printf("Handshake successful with %s (local: %s)", remoteAddr, n.serverAddr)
+// starts the Node
+func (tn *TCPNode) Start() {
+	go tn.handleServer()
+	go tn.handleClient()
+	go tn.ping()
 }
 
-func (n *TCPNode) handleServer() error {
-	log.Print("Booting up server...")
-	ln, err := net.Listen("tcp", n.serverAddr)
+// stops the Node and perform clean-ups
+func (tn *TCPNode) Stop() {
+	tn.stopOnce.Do(func() {
+		close(tn.stopChan)
+		close(tn.msgChan)
+		tn.mu.Lock()
+		defer tn.mu.Unlock()
+		for peerId, peer := range tn.peers {
+			peer.conn.Close()
+			delete(tn.peers, peerId)
+		}
+	})
+}
+
+// handleServer creates a tcp listener, accepts client connections and reads from the connection.
+func (tn *TCPNode) handleServer() {
+	ln, err := net.Listen("tcp", tn.serverAddr)
 	if err != nil {
-		log.Printf("Server failed to start: %v", err)
-		return err
+		tn.Stop()
+		log.Printf("ERROR: unable to start server: %v\n", err)
 	}
+	log.Printf("INFO: server listening on port: %s", tn.serverAddr)
 
 	go func() {
-		<-n.stopChan
+		<-tn.stopChan
 		ln.Close()
 	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-n.stopChan:
-				return nil
-			default:
-				log.Printf("Accept error: %v", err)
-				continue
-			}
+			log.Printf("ERROR: unable to accept connection: %v\n", err)
+			continue
 		}
+		log.Printf("INFO: accepted connection: %s", conn.RemoteAddr())
 
-		go func(conn net.Conn) {
-			defer conn.Close()
-
-			// first, shake hands
-			n.shakeHands(conn)
-
-			// then, continue reading...
-			buf := make([]byte, 1024)
-			for {
-				x, err := conn.Read(buf)
-				if err != nil {
-					log.Printf("Read error from %s: %v", conn.RemoteAddr(), err)
-					return
-				}
-				log.Printf("Message from %s: %s", conn.RemoteAddr(), string(buf[:x]))
-			}
-		}(conn)
+		go tn.Read(conn)
 	}
 }
 
-func (n *TCPNode) handleClient() error {
-	log.Print("Booting up client...")
-	for {
-		select {
-		case <-n.stopChan:
-			return nil
-		case remoteServerAddr := <-n.MsgChan:
-			remoteServerAddr = strings.TrimSpace(remoteServerAddr)
-
-			if n.isalreadyConnected(remoteServerAddr) {
-				continue
-			}
-
-			conn, err := net.DialTimeout("tcp", remoteServerAddr, 5*time.Second)
-			if err != nil {
-				log.Printf("Failed to dial %s: %v", remoteServerAddr, err)
-				continue
-			}
-
-			_, err = conn.Write([]byte(n.serverAddr))
-			if err != nil {
-				log.Printf("Error sending handshake: %v", err)
-				conn.Close()
-				continue
-			}
-
-			buf := make([]byte, 1024)
-			x, err := conn.Read(buf)
-			if err != nil {
-				log.Printf("Error reading handshake response: %v", err)
-				conn.Close()
-				continue
-			}
-
-			receivedAddr := strings.TrimSpace(string(buf[:x]))
-
-			n.mu.Lock()
-			if !n.isalreadyConnected(receivedAddr) {
-				n.clients = append(n.clients, client{conn: conn, addr: receivedAddr})
-				go n.handleClientConnection(conn, receivedAddr)
-			} else {
-				conn.Close()
-			}
-			n.mu.Unlock()
-		}
-	}
-}
-
-func (n *TCPNode) handleClientConnection(conn net.Conn, addr string) {
+// Read reads from the given connection and classifies the message into HandShakeMessage, ClientMessage, PingMessage or a Regular DataMessage.
+//
+// for HandShakeMessage, it sends the message to the msgChan so our client can Dial to it.
+func (tn *TCPNode) Read(conn net.Conn) {
 	defer conn.Close()
-	defer n.removeClient(conn)
 
-	buf := make([]byte, 1024)
+	buff := make([]byte, 1024)
 	for {
-		x, err := conn.Read(buf)
+		n, err := conn.Read(buff)
 		if err != nil {
-			log.Printf("Client read error from %s: %v", addr, err)
+			log.Printf("ERROR: read from %s failed: %v\n", conn.RemoteAddr(), err)
 			return
 		}
-		log.Printf("Message from %s: %s", addr, string(buf[:x]))
-	}
-}
 
-func (n *TCPNode) Broadcast(message []byte) {
-	log.Print("Broadcasting: ", string(message), " to: ", n.clients)
-	for _, c := range n.clients {
-		log.Print("client found: ", c)
-		n, err := c.conn.Write(message)
-		log.Printf("written %d bytes: ", n)
-		if err != nil {
-			log.Printf("Error sending message to %s: %v", c.addr, err)
+		message := ParseMessage(buff[:n])
+		switch message.Type {
+		case PingMessage:
+			continue
+		case HandshakeMessage:
+			tn.msgChan <- Message{Payload: message.Payload, Type: ClientMessage, SenderId: message.SenderId}
+		case DataMessage:
+			func(message Message) {
+				log.Printf("INFO: Processed message: %v %v", string(message.SenderId), string(message.Payload))
+			}(message)
 		}
 	}
 }
 
-func (n *TCPNode) removeClient(conn net.Conn) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for i, c := range n.clients {
-		if c.conn == conn {
-			n.clients = slices.Delete(n.clients, i, i+1)
-			break
+// handleClient reads from the msgChan, if received a HandShakeMessage, it Dials to the provided serverAddr in payload.
+func (tn *TCPNode) handleClient() {
+	for {
+		select {
+		case message := <-tn.msgChan:
+			if message.Type == ClientMessage {
+				if _, exists := tn.peers[message.SenderId]; !exists {
+					conn, err := net.Dial("tcp", string(message.Payload))
+					if err != nil {
+						log.Printf("ERROR: unable to dial: %v, %v\n", string(message.Payload), err)
+					}
+					tcpConn, ok := conn.(*net.TCPConn)
+					if ok {
+						// socket level keep-alive just to enure connectivity.
+						tcpConn.SetKeepAlive(true)
+						tcpConn.SetKeepAlivePeriod(30 * time.Second)
+					}
+					if _, err = conn.Write([]byte("HS:" + tn.nodeId + ":" + tn.serverAddr)); err != nil {
+						log.Printf("ERROR: unable to write HS: %v, %v\n", string(message.Payload), err)
+						conn.Close()
+						continue
+					}
+					tn.mu.Lock()
+					tn.peers[message.SenderId] = &Peer{
+						peerId:     tn.nodeId,
+						serverAddr: string(message.Payload),
+						conn:       conn,
+					}
+					tn.mu.Unlock()
+				}
+			}
+			if message.Type == DataMessage {
+				log.Printf("INFO: Client Processed message: %v %v", string(message.SenderId), string(message.Payload))
+				// we will decide what to do with data later...
+			}
+		case <-tn.stopChan:
+			return
 		}
 	}
 }
 
-func (n *TCPNode) Start() {
-	go n.handleServer()
-	go n.handleClient()
-}
+// pings all the peer connections
+func (tn *TCPNode) ping() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
 
-func (n *TCPNode) Stop() {
-	close(n.stopChan)
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for _, c := range n.clients {
-		c.conn.Close()
-	}
-	n.clients = nil
-}
-
-func (n *TCPNode) isalreadyConnected(addr string) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if addr == n.serverAddr {
-		return true
-	}
-
-	ac := false
-	for _, c := range n.clients {
-		if c.addr == addr {
-			ac = true
-			break
+	for {
+		select {
+		case <-ticker.C:
+			for peerId, peer := range tn.peers {
+				if _, err := peer.conn.Write([]byte("PING")); err != nil {
+					tn.mu.Lock()
+					log.Printf("ERROR: ping failed for peer %s: %v", peerId, err)
+					peer.conn.Close()
+					delete(tn.peers, peerId)
+					tn.mu.Unlock()
+					return
+				}
+			}
+		case <-tn.stopChan:
+			return
 		}
 	}
-
-	return ac
 }
