@@ -24,7 +24,7 @@ func main() {
 		}
 	}()
 
-  // spwan workers
+  // spawn workers
 	for range 10 {
 		wpool.AddWork(func() any {
 			return makeReq()
